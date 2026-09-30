@@ -66,6 +66,32 @@ class TestCombineFiles:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_same_file_twice_is_one_object_with_the_copies_added(self, async_client: AsyncClient):
+        box_id = await _upload(async_client, "box.stl", _stl(trimesh.creation.box((10, 10, 10))))
+        cyl_id = await _upload(async_client, "cyl.stl", _stl(trimesh.creation.cylinder(radius=5, height=8)))
+
+        resp = await async_client.post(
+            "/api/v1/library/files/combine",
+            json={
+                "items": [
+                    {"file_id": box_id, "copies": 2},
+                    {"file_id": cyl_id},
+                    {"file_id": box_id, "copies": 3},
+                ],
+                "filename": "dupes",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        content = await _download(async_client, resp.json()["id"])
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            xml = zf.read("3D/3dmodel.model").decode()
+        # The box mesh is stored once (object 1, first appearance) with 5 copies.
+        assert re.findall(r'<object id="(\d+)" name="([^"]+)"', xml) == [("1", "box"), ("2", "cyl")]
+        assert re.findall(r'<item objectid="(\d+)"', xml) == ["1"] * 5 + ["2"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_lands_in_requested_folder(self, async_client: AsyncClient, db_session):
         folder = (await async_client.post("/api/v1/library/folders", json={"name": "Combos"})).json()
         box_id = await _upload(async_client, "box.stl", _stl(trimesh.creation.box((10, 10, 10))))

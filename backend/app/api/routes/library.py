@@ -2863,30 +2863,37 @@ async def combine_files(
     # Same per-row visibility the slice route applies: a READ_OWN caller must
     # not be able to pull another user's model into their own file by raw id.
     can_read_all = current_user is None or current_user.has_permission(Permission.LIBRARY_READ_ALL.value)
-    file_ids = {item.file_id for item in request.items}
-    rows = (await db.execute(LibraryFile.active().where(LibraryFile.id.in_(file_ids)))).scalars().all()
+
+    # The same file listed twice is one object with the copies added up, so
+    # its mesh is loaded and stored once. Order follows first appearance.
+    copies_by_id: dict[int, int] = {}
+    for item in request.items:
+        copies_by_id[item.file_id] = copies_by_id.get(item.file_id, 0) + item.copies
+
+    rows = (await db.execute(LibraryFile.active().where(LibraryFile.id.in_(copies_by_id)))).scalars().all()
     by_id = {row.id: row for row in rows}
 
     # Gate every source before touching any of them on disk, so the answer for
     # a file the caller can't see is the same 404 whatever else is in the list.
-    sources = [
-        _ensure_library_file_visible(by_id.get(item.file_id), current_user, can_read_all) for item in request.items
-    ]
+    sources = [_ensure_library_file_visible(by_id.get(file_id), current_user, can_read_all) for file_id in copies_by_id]
 
     parts: list[CombinePart] = []
-    for item, lib_file in zip(request.items, sources, strict=True):
+    for lib_file in sources:
         if not lib_file.filename.lower().endswith(".stl"):
             raise HTTPException(status_code=400, detail=f"Only STL files can be combined: {lib_file.filename}")
         src_path = _resolve_source_disk_path(lib_file)
         if src_path is None or not src_path.exists():
             raise HTTPException(status_code=404, detail=f"Source file missing on disk: {lib_file.filename}")
-        parts.append(CombinePart(name=lib_file.filename, path=src_path, copies=item.copies))
+        parts.append(CombinePart(name=lib_file.filename, path=src_path, copies=copies_by_id[lib_file.id]))
 
     try:
         content = await asyncio.to_thread(combine_parts_to_3mf, parts)
     except MeshCombineError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # The preview is embedded as Metadata/thumbnail.png by combine_parts_to_3mf,
+    # so ThreeMFParser picks it up here like any other 3MF's thumbnail. Loading
+    # the combined file back to render one would expand every copy.
     library_file, _ = await save_3mf_bytes_to_library(
         db,
         file_bytes=content,
@@ -2895,17 +2902,6 @@ async def combine_files(
         source_type="combined",
         owner_id=current_user.id if current_user else None,
     )
-
-    # A plain 3MF carries no preview image, so render one from the geometry
-    # the same way STL uploads get theirs.
-    if library_file.thumbnail_path is None:
-        disk_path = _resolve_source_disk_path(library_file)
-        if disk_path is not None:
-            thumb = await asyncio.to_thread(generate_stl_thumbnail, disk_path, get_library_thumbnails_dir())
-            if thumb:
-                library_file.thumbnail_path = to_relative_path(thumb)
-                await db.commit()
-                await db.refresh(library_file)
 
     return FileUploadResponse(
         id=library_file.id,
