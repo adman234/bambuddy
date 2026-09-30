@@ -2887,7 +2887,9 @@ export function FileManagerPage() {
         <CombineFilesModal
           files={selectedStlFiles}
           folderId={selectedFolderId}
-          canSlice={!!settings?.use_slicer_api && hasPermission('library:upload')}
+          // canSlice() also covers the desktop-slicer handoff; "open the
+          // slicer next" means the in-app SliceModal, so the sidecar must be on.
+          canSlice={!!settings?.use_slicer_api && canSlice()}
           onClose={() => setShowCombineModal(false)}
           onCombined={(result, sliceNext) => {
             setShowCombineModal(false);
