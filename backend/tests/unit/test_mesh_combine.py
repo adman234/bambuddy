@@ -7,13 +7,17 @@ import zipfile
 import pytest
 import trimesh
 
+from backend.app.services import mesh_combine, stl_thumbnail
 from backend.app.services.mesh_combine import (
     LAYOUT_GAP_MM,
     MAX_COMBINE_INSTANCES,
+    THUMBNAIL_FACE_BUDGET,
+    THUMBNAIL_PATH,
     CombinePart,
     MeshCombineError,
     combine_parts_to_3mf,
     layout_offsets,
+    thumbnail_faces_per_copy,
 )
 
 
@@ -102,3 +106,100 @@ def test_rejects_empty_mesh(tmp_path):
     empty.write_bytes(b"solid empty\nendsolid empty\n")
     with pytest.raises(MeshCombineError, match="empty.stl"):
         combine_parts_to_3mf([CombinePart("empty.stl", empty, 1)])
+
+
+# --- embedded thumbnail --------------------------------------------------
+
+
+def test_thumbnail_is_embedded_and_found_by_the_library_parser(tmp_path, box_stl, cyl_stl):
+    from backend.app.services.archive import ThreeMFParser
+
+    data = combine_parts_to_3mf([CombinePart("box.stl", box_stl, 2), CombinePart("cyl.stl", cyl_stl, 1)])
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        png = zf.read(THUMBNAIL_PATH)
+        rels = zf.read("_rels/.rels").decode()
+        types = zf.read("[Content_Types].xml").decode()
+    assert png.startswith(b"\x89PNG")
+    assert f'Target="/{THUMBNAIL_PATH}"' in rels and "relationships/metadata/thumbnail" in rels
+    assert 'Extension="png"' in types
+
+    out = tmp_path / "combined.3mf"
+    out.write_bytes(data)
+    assert ThreeMFParser(out).parse().get("_thumbnail_data") == png
+
+
+def test_preview_stays_within_the_face_budget_however_many_copies(tmp_path, monkeypatch):
+    # 20,480 faces per source: 100 copies would be 2M faces unsimplified.
+    ball = tmp_path / "ball.stl"
+    ball.write_bytes(trimesh.creation.icosphere(subdivisions=5).export(file_type="stl"))
+    drawn = []
+    monkeypatch.setattr(stl_thumbnail, "render_mesh_png", lambda mesh, **_: drawn.append(len(mesh.faces)) or b"png")
+
+    combine_parts_to_3mf([CombinePart("ball.stl", ball, 100)])
+
+    assert drawn and drawn[0] <= THUMBNAIL_FACE_BUDGET
+    assert thumbnail_faces_per_copy(100) * 100 <= THUMBNAIL_FACE_BUDGET
+
+
+def test_preview_does_not_reload_the_combined_file(tmp_path, box_stl, monkeypatch):
+    # The expensive path was loading the finished 3MF back, which expands
+    # every build item. Only the source STL may be loaded.
+    loaded = []
+    real_load = trimesh.load
+    monkeypatch.setattr(trimesh, "load", lambda path, **kw: loaded.append(str(path)) or real_load(path, **kw))
+
+    combine_parts_to_3mf([CombinePart("box.stl", box_stl, 5)])
+
+    assert loaded == [str(box_stl)]
+
+
+def test_a_failed_preview_does_not_fail_the_combine(box_stl, monkeypatch):
+    def boom(*_, **__):
+        raise RuntimeError("renderer unavailable")
+
+    monkeypatch.setattr(stl_thumbnail, "render_mesh_png", boom)
+    data = combine_parts_to_3mf([CombinePart("box.stl", box_stl, 1)])
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert THUMBNAIL_PATH not in zf.namelist()
+        assert "thumbnail" not in zf.read("_rels/.rels").decode()
+    assert "<item " in _model_xml(data)
+
+
+# --- source caps ---------------------------------------------------------
+
+
+def test_rejects_sources_over_the_byte_cap_before_loading(box_stl, cyl_stl, monkeypatch):
+    monkeypatch.setattr(mesh_combine, "MAX_COMBINE_SOURCE_BYTES", box_stl.stat().st_size)
+    monkeypatch.setattr(mesh_combine, "_load_part", lambda part: pytest.fail("loaded despite the byte cap"))
+    with pytest.raises(MeshCombineError, match="too large"):
+        combine_parts_to_3mf([CombinePart("box.stl", box_stl, 1), CombinePart("cyl.stl", cyl_stl, 1)])
+
+
+def test_rejects_sources_over_the_face_cap(box_stl, cyl_stl, monkeypatch):
+    monkeypatch.setattr(mesh_combine, "MAX_COMBINE_SOURCE_FACES", 20)
+    with pytest.raises(MeshCombineError, match="too detailed"):
+        combine_parts_to_3mf([CombinePart("box.stl", box_stl, 1), CombinePart("cyl.stl", cyl_stl, 1)])
+
+
+def test_copies_do_not_count_against_the_face_cap(box_stl, monkeypatch):
+    # A box has 12 faces; the mesh is stored once however many copies there are.
+    monkeypatch.setattr(mesh_combine, "MAX_COMBINE_SOURCE_FACES", 12)
+    combine_parts_to_3mf([CombinePart("box.stl", box_stl, 50)])
+
+
+# --- streamed model XML --------------------------------------------------
+
+
+def test_streamed_model_spans_chunks_intact(tmp_path, monkeypatch):
+    monkeypatch.setattr(mesh_combine, "_XML_CHUNK_ROWS", 7)
+    ball = tmp_path / "ball.stl"
+    source = trimesh.creation.icosphere(subdivisions=2)
+    ball.write_bytes(source.export(file_type="stl"))
+
+    data = combine_parts_to_3mf([CombinePart("ball.stl", ball, 2)])
+
+    xml = _model_xml(data)
+    assert xml.count("<triangle ") == len(source.faces)
+    assert xml.count("<vertex ") == len(trimesh.load(ball, force="mesh").vertices)
+    reloaded = trimesh.load(io.BytesIO(data), file_type="3mf").dump()
+    assert [len(m.faces) for m in reloaded] == [len(source.faces)] * 2
