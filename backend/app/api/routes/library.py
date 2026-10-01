@@ -658,8 +658,10 @@ async def save_3mf_bytes_to_library(
     thumbnail_path: str | None = None
     if ext == ".3mf":
         try:
+            # Off the event loop: the parser still decompresses the whole model
+            # entry, which for a combined plate is hundreds of MB (#3162).
             parser = ThreeMFParser(str(file_path))
-            raw_metadata = parser.parse()
+            raw_metadata = await asyncio.to_thread(parser.parse)
             thumb_data = raw_metadata.get("_thumbnail_data")
             thumb_ext = raw_metadata.get("_thumbnail_ext", ".png")
             if thumb_data:
